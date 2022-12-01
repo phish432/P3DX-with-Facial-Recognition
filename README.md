@@ -1,2 +1,11 @@
 # P3DX-with-Facial-Recognition
-Integration of face recognition module with Slam in P3DX.
+
+## Team: Slash
+
+- Aaron Monis
+- Agrim Rawat
+- Tanmay Goyal
+
+## Project Description:
+
+Integration of face recognition module with SLAM in P3DX.
