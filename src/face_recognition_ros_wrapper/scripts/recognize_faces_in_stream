@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+
+import rospy
+import sys
+from dis import Instruction
+from http import client
+import rosnode
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+import actionlib
+import cv2
+import face_recognition
+import numpy as np
+import pickle
+from cv_bridge import CvBridge, CvBridgeError
+
+import tf
+from tf import TransformListener
+
+from std_msgs.msg import String, Bool
+from sensor_msgs.msg import Image
+
+K = np.matrix([378.24713134765625, 0.0, 325.074951171875, 0.0, 378.01171875, 246.03689575195312, 0.0, 0.0, 1.0]).reshape(3, 3)
+
+global command
+command="start"
+
+def callback(message):
+    global command
+    command=message.data
+    # print(command)
+
+def reach_callback(msg):
+    global reach
+    reach=msg.data
+
+class face_recognizer:
+    global command,reach
+    # print(command)
+    def __init__(self):
+
+        self.locations = None
+
+        global name_pub,reach
+        # reach=False
+        # rospy.init_node("lang_nav")
+        
+        self.client = actionlib.SimpleActionClient('move_base',MoveBaseAction)
+        self.client.wait_for_server()
+
+        self.tf = TransformListener()
+
+        rospy.Subscriber("chatter", String, callback)
+        rospy.Subscriber("reached", Bool, reach_callback)
+
+        self.pub = rospy.Publisher('recognized_faces', String, queue_size=10)
+        self.pub1 = rospy.Publisher('face_locations_approx', String, queue_size=10)
+        self.sub = rospy.Subscriber(
+            rospy.get_param(rospy.resolve_name("~video_stream_topic")), 
+            Image, 
+            self.recognize_faces_callback)
+
+        self.sub1 = rospy.Subscriber(
+            rospy.get_param(rospy.resolve_name("~depth_stream_topic")), 
+            Image, 
+            self.recognize_depth_callback)
+
+        name_pub=rospy.Publisher("/human_name",String,queue_size=10)
+
+        self.encodings_data = self.init_encodings_dict()
+        self.bridge = CvBridge()
+
+    def init_encodings_dict(self):
+        face_encodings_file = rospy.get_param("face_encodings_location")    
+        encodings_data = pickle.loads(open(face_encodings_file, "rb").read())
+
+        return encodings_data
+
+    def recognize_faces_callback(self, data):
+        cv_image = self.convert_image(data)
+        name = self.get_face_match(cv_image)
+
+        if name is not None:
+            self.pub.publish(name)
+
+    def recognize_depth_callback(self, data):
+        cv_image = self.convert_depth(data)
+        depth = self.get_face_depth(cv_image)
+
+        if depth is not None:
+            self.pub1.publish(depth)
+
+    def convert_image(self, data):
+        try:
+            return self.bridge.imgmsg_to_cv2(data, "rgb8")
+        except CvBridgeError as e:
+            print(e)
+
+    def convert_depth(self, data):
+        try:
+            return self.bridge.imgmsg_to_cv2(data, data.encoding)
+        except CvBridgeError as e:
+            print(e)
+
+    def get_face_match(self, cv_image):
+        boxes = face_recognition.face_locations(cv_image, model='hog')
+
+        self.locations = list()
+
+        if not boxes:
+            return None
+        else:
+            encodings = face_recognition.face_encodings(cv_image, boxes)
+        names = ""
+        for encoding, location in zip(encodings, boxes):
+            print(location)
+            matches = face_recognition.compare_faces(self.encodings_data["encodings"], encoding)
+            if True in matches:
+                matchedIdxs = [i for (i, b) in enumerate(matches) if b]
+                counts = {}
+
+                for i in matchedIdxs:
+                    name = self.encodings_data["names"][i]
+                    counts[name] = counts.get(name, 0) + 1
+
+                name = max(counts, key=counts.get)
+                self.locations.append((name, location))
+                names += name + ','
+        if len(names) == 0:
+            return None
+        else:
+            return names[:-1]
+
+    def execute_command(self, user_input, px):
+        global name_pub,reach
+        position = ""
+        quaternion = ""
+        # if self.tf.frameExists("/base_link") and self.tf.frameExists("/map"):
+            # t = self.tf.getLatestCommonTime("/base_link", "/map")
+
+        cx = K[0,2]
+        cy = K[1,2]
+        fx_inv = 1.0 / K[0,0]
+        fy_inv = 1.0 / K[1,1]
+
+        position, quaternion = self.tf.lookupTransform("/base_link", "/map", rospy.Time(0))
+        position = -np.array(position)
+        print(position, quaternion)
+        euler = tf.transformations.euler_from_quaternion(quaternion)
+        roll = euler[0]
+        pitch = euler[1]
+        yaw = euler[2]
+
+        x = -user_input * ((px[0] - cx) * fx_inv)
+        y = -user_input * ((px[1] - cy) * fy_inv) *0.1
+
+        print(x, y)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = position[0] + x
+        goal.target_pose.pose.position.y = position[1] + y
+        goal.target_pose.pose.orientation.x = quaternion[0]
+        goal.target_pose.pose.orientation.y = quaternion[1]
+        goal.target_pose.pose.orientation.z = quaternion[2]
+        goal.target_pose.pose.orientation.w = quaternion[3]
+                        
+        self.client.send_goal(goal)
+        wait = self.client.wait_for_result()
+
+        if not wait:
+            rospy.logerr("Action server not available!")
+            rospy.signal_shutdown("Action server not available!")
+            return 0
+        else:
+            if self.client.get_result():
+                print(f"Reached Location")
+                rospy.signal_shutdown("Location Reached")
+                return 1
+            else:
+                print(f"Couldn't Reach Location")
+                return 0
+        
+
+
+    def get_face_depth(self, cv_image):
+        global command
+        name_locs = ""
+        print(len(self.locations))
+        if self.locations is None or len(self.locations) == 0:
+            return None
+        else:
+            for name, locs in self.locations:
+                # pix = (int((locs[0] + locs[2])/2), int((locs[1] + locs[3])/2))
+                # self.pix = pix
+                # line = 'Depth at pixel(%3d, %3d): %7.1f(mm).' % (pix[0], pix[1], cv_image[pix[1], pix[0]]) 
+                # name_locs += f'{name} - {line},'
+                # # print(name, command)
+                # if name == (command).strip():
+                #     user_input = command
+                #     # print('ye boi')
+                #     # print(command)
+
+                #     depth = cv_image[pix[1], pix[0]]/1000
+
+                #     # print(depth)
+
+                #     if depth < 0.5:
+                #         print('Reached')
+                #         continue
+                        
+                #     # print('ye boi')
+                    
+                #     result = self.execute_command(depth, pix)
+                #     if result:
+                #         exit(0)
+
+                pix = (int((locs[0] + locs[2])/2), int((locs[1] + locs[3])/2))
+                self.pix = pix
+                totaldepth = 0
+                for i in range(pix[0] - 10, pix[0] + 10):
+                    for j in range(pix[1] - 10, pix[1] + 10):
+                        totaldepth += cv_image[j, i]
+                avgdepth = totaldepth/400
+                line = 'Depth: %7.1f(mm).' % (avgdepth) 
+                name_locs += f'{name} - {line},'
+                print(name, command)
+                if name == (command).strip():
+                    user_input = command
+                    # print('ye boi')
+                    # print(command)
+
+                    depth = avgdepth/1000
+
+                    # print(depth)
+
+                    if depth < 0.5:
+                        print('Reached')
+                        continue
+                        
+                    # print('ye boi')
+                    
+                    result = self.execute_command(depth - 1, pix)
+                    if result:
+                        exit(0)
+                        
+                return name_locs
+        # indices = indices = np.array(np.where(cv_image == cv_image[cv_image > 0].min()))[:,0]
+        # pix = (indices[1], indices[0])
+        # line = 'Depth at pixel(%3d, %3d): %7.1f(mm).' % (pix[0], pix[1], cv_image[pix[1], pix[0]]) 
+
+def main(args):
+    try:
+        rospy.init_node('stream_face_recognizer', disable_signals=True)
+        rate = rospy.Rate(30)
+        face_recognizer_object = face_recognizer()
+        print("Ready to recognize faces in video stream")
+
+        rospy.spin()
+
+    except rospy.ROSInterruptException as e:
+        print(e)
+
+
+if __name__ == "__main__":
+    main(sys.argv)
